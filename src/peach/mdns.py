@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import ctypes
 import logging
+import select
 import socket
-import subprocess
 import sys
 import threading
 import time
 import ipaddress
 from collections.abc import Callable
 
+import ifaddr
 from zeroconf import ServiceInfo, Zeroconf
 
 
@@ -57,6 +59,25 @@ def lan_ipv4() -> str:
     return max(candidates)[2]
 
 
+def lan_ipv6(ipv4: str) -> tuple[str, ...]:
+    """与 `ipv4` 同一块网卡上可发布的 IPv6：全球单播与 ULA，不含链路本地。
+
+    链路本地地址要带网卡序号才能连，浏览器的地址栏用不了，所以不发布。
+    """
+    found: set[str] = set()
+    for adapter in ifaddr.get_adapters():
+        if not any(entry.is_IPv4 and entry.ip == ipv4 for entry in adapter.ips):
+            continue
+        for entry in adapter.ips:
+            if not entry.is_IPv6:
+                continue
+            address = ipaddress.IPv6Address(entry.ip[0].split("%", 1)[0])
+            if address.is_loopback or address.is_link_local or address.is_multicast:
+                continue
+            found.add(str(address))
+    return tuple(sorted(found))
+
+
 def _explicit_resolver(address: str) -> Callable[[], str]:
     parsed = ipaddress.ip_address(address)
     if not isinstance(parsed, ipaddress.IPv4Address):
@@ -102,6 +123,19 @@ def answers_on_network(hostname: str, timeout: float = 2.0) -> bool:
     return False
 
 
+def _resolve(address_resolver: Callable[[], str],
+             ipv6_resolver: Callable[[str], tuple[str, ...]] | None) -> tuple[str, tuple[str, ...]]:
+    """本轮要发布的 IPv4 与同网卡 IPv6。读不到 IPv6 只少发 AAAA，不影响 A 记录。"""
+    address = address_resolver()
+    if ipv6_resolver is None:
+        return address, ()
+    try:
+        return address, tuple(ipv6_resolver(address))
+    except OSError:
+        LOGGER.warning("读取网卡 IPv6 地址失败，本轮只发布 IPv4", exc_info=True)
+        return address, ()
+
+
 class MdnsPublisher:
     """Publish Peach exactly like the verified pre-migration web server.
 
@@ -120,14 +154,17 @@ class MdnsPublisher:
         secure: bool = False,
         address_resolver: Callable[[], str] = lan_ipv4,
         refresh_seconds: float = REFRESH_SECONDS,
+        ipv6_resolver: Callable[[str], tuple[str, ...]] | None = None,
     ) -> None:
         self.name = _normalized_name(name)
         self.port = port
         self.secure = secure
         self._address_resolver = address_resolver
+        self._ipv6_resolver = ipv6_resolver
         self._zeroconf: Zeroconf | None = None
         self._info: ServiceInfo | None = None
         self.address: str | None = None
+        self.ipv6_addresses: tuple[str, ...] = ()
         self.status = "pending"
         self.refresh_seconds = refresh_seconds
         self._stop = threading.Event()
@@ -144,15 +181,17 @@ class MdnsPublisher:
         finally:
             self._start_watcher()
 
-    def _register(self) -> None:
+    def _register(self, current: tuple[str, tuple[str, ...]] | None = None) -> None:
         if self._zeroconf is not None:
             return
-        address = self._address_resolver()
+        address, ipv6 = current or _resolve(self._address_resolver, self._ipv6_resolver)
         service_type = HTTPS_SERVICE_TYPE if self.secure else HTTP_SERVICE_TYPE
+        # AAAA 记录同样经 IPv4 组播应答；监听语义不变，仍是 ADR-0009 的全网卡 `Zeroconf()`。
         info = ServiceInfo(
             service_type,
             f"{self.name}.{service_type}",
-            addresses=[socket.inet_aton(address)],
+            addresses=[socket.inet_aton(address)]
+            + [socket.inet_pton(socket.AF_INET6, item) for item in ipv6],
             port=self.port,
             properties={"path": "/", "scheme": "https" if self.secure else "http"},
             server=f"{self.hostname}.",
@@ -166,6 +205,7 @@ class MdnsPublisher:
         self._zeroconf = zeroconf
         self._info = info
         self.address = address
+        self.ipv6_addresses = ipv6
         self.status = self.hostname
 
     def stop(self) -> None:
@@ -196,16 +236,16 @@ class MdnsPublisher:
         记录比没有记录更糟，客户端会一直连一个不存在的地方。
         """
         try:
-            address = self._address_resolver()
+            current = _resolve(self._address_resolver, self._ipv6_resolver)
         except (OSError, RuntimeError):
             if self._zeroconf is not None:
                 self._unregister()
                 self.status = "unavailable"
             return "unavailable"
-        if self._zeroconf is not None and address == self.address:
+        if self._zeroconf is not None and current == (self.address, self.ipv6_addresses):
             return "unchanged"
         self._unregister()
-        self._register()
+        self._register(current)
         return "republished"
 
     def _unregister(self) -> None:
@@ -219,15 +259,118 @@ class MdnsPublisher:
             self._zeroconf = None
             self._info = None
             self.address = None
+            self.ipv6_addresses = ()
             self.status = "stopped"
 
+
+
+_DNS_SD_LIBRARY = "/usr/lib/libSystem.B.dylib"
+_RECORD_TYPES = {4: 1, 6: 28}          # A、AAAA
+_FLAG_UNIQUE = 0x20                     # kDNSServiceFlagsUnique：主机名记录归本机独有
+_FLAG_SHARE_CONNECTION = 0x4000         # kDNSServiceFlagsShareConnection
+_RecordCallback = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+                                   ctypes.c_int32, ctypes.c_void_p)
+_ServiceCallback = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int32,
+                                    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p)
+
+
+def _dns_sd():
+    library = ctypes.CDLL(_DNS_SD_LIBRARY)
+    ref = ctypes.c_void_p
+    library.DNSServiceCreateConnection.argtypes = [ctypes.POINTER(ref)]
+    library.DNSServiceRegisterRecord.argtypes = [
+        ref, ctypes.POINTER(ref), ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p,
+        ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint16, ctypes.c_void_p, ctypes.c_uint32,
+        _RecordCallback, ctypes.c_void_p]
+    library.DNSServiceRegister.argtypes = [
+        ctypes.POINTER(ref), ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_uint16, ctypes.c_void_p,
+        _ServiceCallback, ctypes.c_void_p]
+    library.DNSServiceRefSockFD.argtypes = [ref]
+    library.DNSServiceProcessResult.argtypes = [ref]
+    library.DNSServiceRefDeallocate.argtypes = [ref]
+    return library
+
+
+class _DnsSdRegistration:
+    """一条到 mDNSResponder 的连接：主机名的 A/AAAA 记录与服务记录同在其上。
+
+    `dns-sd -P` 只能带一个地址，再起一条连接补 AAAA 会和它的主机名记录互判冲突，
+    所以直接调 `dns_sd.h`。连接断开（mDNSResponder 重启）时记录随之撤销，`alive`
+    转为 False，由复查重建。连接只在自己的线程里处理与释放，`dns_sd` 的引用不能跨线程并用。
+    """
+
+    def __init__(self, name: str, service: str, port: int, hostname: str,
+                 addresses: tuple[str, ...]) -> None:
+        self._library = _dns_sd()
+        self._callbacks = (_RecordCallback(self._record_reply), _ServiceCallback(self._service_reply))
+        self._connection = ctypes.c_void_p()
+        self._stop = threading.Event()
+        self._failed = False
+        self._check(self._library.DNSServiceCreateConnection(ctypes.byref(self._connection)))
+        try:
+            host = f"{hostname}.".encode()
+            for address in addresses:
+                parsed = ipaddress.ip_address(address)
+                record = ctypes.c_void_p()
+                self._check(self._library.DNSServiceRegisterRecord(
+                    self._connection, ctypes.byref(record), _FLAG_UNIQUE, 0, host,
+                    _RECORD_TYPES[parsed.version], 1, len(parsed.packed), parsed.packed, 240,
+                    self._callbacks[0], None))
+            service_ref = ctypes.c_void_p(self._connection.value)
+            self._check(self._library.DNSServiceRegister(
+                ctypes.byref(service_ref), _FLAG_SHARE_CONNECTION, 0, name.encode(),
+                service.encode(), None, host, socket.htons(port), 0, None,
+                self._callbacks[1], None))
+        except Exception:
+            self._library.DNSServiceRefDeallocate(self._connection)
+            raise
+        self._thread = threading.Thread(target=self._pump, name="peach-dns-sd", daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _check(code: int) -> None:
+        if code:
+            raise OSError(f"mDNSResponder 拒绝注册（错误 {code}）")
+
+    def _record_reply(self, _connection, _record, _flags, error, _context) -> None:
+        if error:
+            LOGGER.warning("mDNS 主机名记录注册失败（错误 %s）", error)
+
+    def _service_reply(self, _service, _flags, error, name, _type, _domain, _context) -> None:
+        if error:
+            LOGGER.warning("mDNS 服务注册失败（错误 %s）", error)
+
+    def _pump(self) -> None:
+        descriptor = self._library.DNSServiceRefSockFD(self._connection)
+        try:
+            while not self._stop.is_set():
+                if not select.select([descriptor], [], [], 0.5)[0]:
+                    continue
+                if self._library.DNSServiceProcessResult(self._connection):
+                    LOGGER.warning("与 mDNSResponder 的连接已断开")
+                    self._failed = True
+                    return
+        except (OSError, ValueError):
+            LOGGER.exception("mDNS 结果处理失败")
+            self._failed = True
+        finally:
+            self._library.DNSServiceRefDeallocate(self._connection)
+
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive() and not self._failed
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
 
 
 class DnsSdPublisher:
     """macOS：把广播交给系统的 mDNSResponder，不自己跑一套 mDNS 栈。
 
     自带 zeroconf 在 launchd 起的进程里会被「本地网络」隐私门静默拒绝——注册看着成功，
-    实际一个多播包都发不出去（见 `answers_on_network`）。而 `dns-sd` 只是通过 UNIX 套接字
+    实际一个多播包都发不出去（见 `answers_on_network`）。而 `dns_sd` 只是通过 UNIX 套接字
     请求系统那个本来就在跑、本来就有权限的 mDNSResponder 代发，同样由 launchd 启动却一切
     正常，实测过。
 
@@ -243,15 +386,18 @@ class DnsSdPublisher:
         secure: bool = False,
         address_resolver: Callable[[], str] = lan_ipv4,
         refresh_seconds: float = REFRESH_SECONDS,
+        ipv6_resolver: Callable[[str], tuple[str, ...]] | None = None,
     ) -> None:
         self.name = _normalized_name(name)
         self.port = port
         self.secure = secure
         self._address_resolver = address_resolver
+        self._ipv6_resolver = ipv6_resolver
         self.refresh_seconds = refresh_seconds
         self.address: str | None = None
+        self.ipv6_addresses: tuple[str, ...] = ()
         self.status = "pending"
-        self._process: subprocess.Popen | None = None
+        self._registration: _DnsSdRegistration | None = None
         self._stop = threading.Event()
         self._watcher: threading.Thread | None = None
 
@@ -259,32 +405,27 @@ class DnsSdPublisher:
     def hostname(self) -> str:
         return f"{self.name}.local"
 
-    def _register(self) -> None:
-        if self._process is not None and self._process.poll() is None:
+    def _register(self, current: tuple[str, tuple[str, ...]] | None = None) -> None:
+        if self._registration is not None and self._registration.alive:
             return
-        address = self._address_resolver()
+        address, ipv6 = current or _resolve(self._address_resolver, self._ipv6_resolver)
         service = "_https._tcp" if self.secure else "_http._tcp"
-        self._process = subprocess.Popen(
-            ["/usr/bin/dns-sd", "-P", self.name, service, "local",
-             str(self.port), self.hostname, address],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        self._registration = _DnsSdRegistration(
+            self.name, service, self.port, self.hostname, (address, *ipv6))
         self.address = address
+        self.ipv6_addresses = ipv6
         # 不在这里自证可达：本进程由 launchd 启动，「本地网络」隐私门挡的正是自己发多播，
         # 探针必然收不到回应，会把好的判成 unreachable。记录是系统 mDNSResponder 发的，
-        # `dns-sd` 子进程还活着就说明注册仍在生效——这是本进程能拿到的最强证据。
+        # 连接还在就说明注册仍在生效——这是本进程能拿到的最强证据。
         # 真要验，用 `scripts/check_mdns.py`，它从终端跑、有权限。
         self.status = self.hostname
 
     def _unregister(self) -> None:
-        process, self._process = self._process, None
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+        registration, self._registration = self._registration, None
+        if registration is not None:
+            registration.close()
         self.address = None
+        self.ipv6_addresses = ()
         self.status = "stopped"
 
     def start(self) -> None:
@@ -304,19 +445,19 @@ class DnsSdPublisher:
         self._unregister()
 
     def refresh(self) -> str:
-        """地址变了、或 dns-sd 自己退了，就重新注册。"""
+        """地址变了、或与 mDNSResponder 的连接断了，就重新注册。"""
         try:
-            address = self._address_resolver()
+            current = _resolve(self._address_resolver, self._ipv6_resolver)
         except (OSError, RuntimeError):
-            if self._process is not None:
+            if self._registration is not None:
                 self._unregister()
                 self.status = "unavailable"
             return "unavailable"
-        alive = self._process is not None and self._process.poll() is None
-        if alive and address == self.address:
+        alive = self._registration is not None and self._registration.alive
+        if alive and current == (self.address, self.ipv6_addresses):
             return "unchanged"
         self._unregister()
-        self._register()
+        self._register(current)
         return "republished"
 
     def _watch(self) -> None:
@@ -329,15 +470,16 @@ class DnsSdPublisher:
 
 def create_mdns_publisher(
     name: str, port: int, secure: bool = False, address: str | None = None,
-    refresh_seconds: float = REFRESH_SECONDS,
+    refresh_seconds: float = REFRESH_SECONDS, ipv6: bool = False,
 ) -> MdnsPublisher:
-    """`address` 显式钉住时复查是空转：解析器返回常量，地址永远不变。
+    """`address` 显式钉住时 IPv4 不再变化，复查只跟随同网卡的 IPv6 前缀。
 
-    macOS 走系统 mDNSResponder（`DnsSdPublisher`），其余平台用进程内的 zeroconf。
+    `ipv6` 表示服务确实在收 IPv6 连接，只有这时才发布 AAAA 记录。macOS 走系统
+    mDNSResponder（`DnsSdPublisher`），其余平台用进程内的 zeroconf。
     """
     resolver = _explicit_resolver(address) if address else lan_ipv4
     publisher = DnsSdPublisher if sys.platform == "darwin" else MdnsPublisher
     return publisher(
         name, port, secure=secure, address_resolver=resolver,
-        refresh_seconds=refresh_seconds,
+        refresh_seconds=refresh_seconds, ipv6_resolver=lan_ipv6 if ipv6 else None,
     )

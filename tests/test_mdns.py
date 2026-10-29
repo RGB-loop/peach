@@ -1,9 +1,11 @@
+import socket
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from peach.mdns import (
-    DnsSdPublisher, MdnsPublisher, answers_on_network, create_mdns_publisher, lan_ipv4,
+    DnsSdPublisher, MdnsPublisher, answers_on_network, create_mdns_publisher, lan_ipv4, lan_ipv6,
 )
 
 
@@ -122,6 +124,75 @@ class MdnsPublisherTests(unittest.TestCase):
             publisher.stop()
         zeroconf_type.assert_called_once_with()
 
+    def test_ipv6_addresses_on_the_same_interface_are_published_as_aaaa(self):
+        with patch("peach.mdns.Zeroconf") as zeroconf_type:
+            publisher = MdnsPublisher(
+                "peach", 443, secure=True, address_resolver=lambda: "192.0.2.10",
+                refresh_seconds=0, ipv6_resolver=lambda _ipv4: ("2001:db8:1:2::10",),
+            )
+            publisher.start()
+            info = zeroconf_type.return_value.register_service.call_args.args[0]
+            self.assertEqual(info.parsed_addresses(), ["192.0.2.10", "2001:db8:1:2::10"])
+            self.assertEqual(publisher.ipv6_addresses, ("2001:db8:1:2::10",))
+            publisher.stop()
+        # 监听语义不变（ADR-0009）：仍是无参数、全网卡的 Zeroconf()。
+        zeroconf_type.assert_called_once_with()
+
+    def test_a_new_ipv6_prefix_republishes_even_when_ipv4_stays(self):
+        """运营商换前缀只改 IPv6；IPv4 不变也得重发，否则 AAAA 指向旧前缀。"""
+        prefixes = iter([("2001:db8:1:2::10",), ("2001:db8:1:2::10",), ("2001:db8:9:9::10",)])
+        with patch("peach.mdns.Zeroconf") as zeroconf_type:
+            publisher = MdnsPublisher(
+                "peach", 80, address_resolver=lambda: "192.0.2.10", refresh_seconds=0,
+                ipv6_resolver=lambda _ipv4: next(prefixes),
+            )
+            publisher.start()
+            self.assertEqual(publisher.refresh(), "unchanged")
+            self.assertEqual(publisher.refresh(), "republished")
+            self.assertEqual(publisher.ipv6_addresses, ("2001:db8:9:9::10",))
+            publisher.stop()
+        self.assertEqual(zeroconf_type.call_count, 2)
+
+    def test_unreadable_ipv6_still_publishes_ipv4(self):
+        def broken(_ipv4):
+            raise OSError("adapter enumeration failed")
+
+        with patch("peach.mdns.Zeroconf") as zeroconf_type:
+            publisher = MdnsPublisher("peach", 80, address_resolver=lambda: "192.0.2.10",
+                                      refresh_seconds=0, ipv6_resolver=broken)
+            publisher.start()
+            info = zeroconf_type.return_value.register_service.call_args.args[0]
+            self.assertEqual(info.parsed_addresses(), ["192.0.2.10"])
+            publisher.stop()
+
+    def test_only_a_dual_stack_listener_publishes_aaaa(self):
+        """服务没在收 IPv6 时发 AAAA，客户端会优先连一个没人监听的地址。"""
+        with patch("peach.mdns.sys.platform", "linux"):
+            self.assertIsNone(create_mdns_publisher("peach", 80)._ipv6_resolver)
+            self.assertIs(create_mdns_publisher("peach", 80, ipv6=True)._ipv6_resolver, lan_ipv6)
+            pinned = create_mdns_publisher("peach", 80, address="192.0.2.10", ipv6=True)
+            self.assertIs(pinned._ipv6_resolver, lan_ipv6)
+
+    def test_lan_ipv6_takes_routable_addresses_from_the_ipv4_interface(self):
+        """链路本地要带网卡序号才能连，浏览器地址栏用不了；别的网卡（虚拟交换机）不算。"""
+        adapters = [
+            SimpleNamespace(ips=[
+                SimpleNamespace(is_IPv4=True, is_IPv6=False, ip="192.0.2.10"),
+                SimpleNamespace(is_IPv4=False, is_IPv6=True, ip=("2001:db8:1:2::10", 0, 0)),
+                SimpleNamespace(is_IPv4=False, is_IPv6=True, ip=("2001:db8:1:2:aaaa::1", 0, 0)),
+                SimpleNamespace(is_IPv4=False, is_IPv6=True, ip=("fd00::10", 0, 0)),
+                SimpleNamespace(is_IPv4=False, is_IPv6=True, ip=("fe80::10", 0, 12)),
+            ]),
+            SimpleNamespace(ips=[
+                SimpleNamespace(is_IPv4=True, is_IPv6=False, ip="198.51.100.1"),
+                SimpleNamespace(is_IPv4=False, is_IPv6=True, ip=("2001:db8:ffff::1", 0, 0)),
+            ]),
+        ]
+        with patch("peach.mdns.ifaddr.get_adapters", return_value=adapters):
+            self.assertEqual(lan_ipv6("192.0.2.10"),
+                             ("2001:db8:1:2::10", "2001:db8:1:2:aaaa::1", "fd00::10"))
+            self.assertEqual(lan_ipv6("203.0.113.9"), ())
+
     def test_tunnel_route_falls_back_to_real_host_interface(self):
         fake_socket = MagicMock()
         fake_socket.getsockname.return_value = ("198.18.0.1", 50000)
@@ -134,6 +205,93 @@ class MdnsPublisherTests(unittest.TestCase):
             return_value=("host", [], ["192.0.2.2", "203.0.113.1", "198.51.100.162"]),
         ):
             self.assertEqual(lan_ipv4(), "198.51.100.162")
+
+
+class DnsSdPublisherTests(unittest.TestCase):
+    """macOS 发布器：A、AAAA 与服务记录走同一条 mDNSResponder 连接。
+
+    `dns-sd -P` 只带一个地址，另起连接补 AAAA 会和它的主机名记录互判冲突；
+    所以这里核对的是一次注册把全部地址都交给了 `_DnsSdRegistration`。
+    """
+
+    def test_registers_ipv4_and_ipv6_for_the_hostname_together(self):
+        with patch("peach.mdns._DnsSdRegistration") as registration:
+            publisher = DnsSdPublisher(
+                "peach", 8443, secure=True, address_resolver=lambda: "192.0.2.10",
+                refresh_seconds=0, ipv6_resolver=lambda _ipv4: ("2001:db8:1:2::10",),
+            )
+            publisher.start()
+            registration.assert_called_once_with(
+                "peach", "_https._tcp", 8443, "peach.local", ("192.0.2.10", "2001:db8:1:2::10"))
+            self.assertEqual(publisher.status, "peach.local")
+            publisher.stop()
+        registration.return_value.close.assert_called_once()
+
+    def test_a_dropped_daemon_connection_is_rebuilt(self):
+        """mDNSResponder 重启会撤销全部记录；复查发现连接断了就重注册。"""
+        with patch("peach.mdns._DnsSdRegistration") as registration:
+            registration.return_value.alive = True
+            publisher = DnsSdPublisher("peach", 80, address_resolver=lambda: "192.0.2.10",
+                                       refresh_seconds=0)
+            publisher.start()
+            self.assertEqual(publisher.refresh(), "unchanged")
+            registration.return_value.alive = False
+            self.assertEqual(publisher.refresh(), "republished")
+            publisher.stop()
+        self.assertEqual(registration.call_count, 2)
+
+    @unittest.skipUnless(sys.platform == "darwin", "dns_sd 只在 macOS 上")
+    def test_records_resolve_through_the_system_daemon(self):
+        """真实注册一个文档网段的名字，经 mDNSResponder 自己的解析接口取回 A 与 AAAA。
+
+        只说明系统接受并应答了这组记录；局域网另一台设备能否解析由 `check_mdns.py` 验证。
+        """
+        import ctypes
+        import select
+        from peach import mdns
+
+        name = f"peach-test-{socket.gethostname().split('.')[0].lower()[:12]}-{id(self) % 9973}"
+        name = "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in name)
+        registration = mdns._DnsSdRegistration(
+            name, "_http._tcp", 9, f"{name}.local", ("192.0.2.200", "2001:db8::200"))
+        try:
+            library = mdns._dns_sd()
+            reply = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                                     ctypes.c_int32, ctypes.c_char_p, ctypes.c_void_p,
+                                     ctypes.c_uint32, ctypes.c_void_p)
+            found = set()
+
+            def collect(_ref, _flags, _index, error, _host, address, _ttl, _context):
+                if error or not address:
+                    return
+                family = ctypes.cast(address, ctypes.POINTER(ctypes.c_uint8))[1]
+                if family == socket.AF_INET:
+                    raw = ctypes.string_at(address + 4, 4)
+                    found.add(socket.inet_ntop(socket.AF_INET, raw))
+                elif family == socket.AF_INET6:
+                    raw = ctypes.string_at(address + 8, 16)
+                    found.add(socket.inet_ntop(socket.AF_INET6, raw))
+
+            callback = reply(collect)
+            library.DNSServiceGetAddrInfo.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_char_p, reply, ctypes.c_void_p]
+            query = ctypes.c_void_p()
+            self.assertEqual(library.DNSServiceGetAddrInfo(
+                ctypes.byref(query), 0, 0, 0x3, f"{name}.local".encode(), callback, None), 0)
+            try:
+                descriptor = library.DNSServiceRefSockFD(query)
+                for _ in range(20):
+                    if found >= {"192.0.2.200", "2001:db8::200"}:
+                        break
+                    if select.select([descriptor], [], [], 0.25)[0]:
+                        library.DNSServiceProcessResult(query)
+            finally:
+                library.DNSServiceRefDeallocate(query)
+            self.assertTrue(registration.alive)
+        finally:
+            registration.close()
+        self.assertEqual(found, {"192.0.2.200", "2001:db8::200"})
 
 
 class ReachabilityTests(unittest.TestCase):
