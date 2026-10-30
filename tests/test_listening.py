@@ -91,14 +91,14 @@ class BindTests(unittest.TestCase):
             self.assertEqual(sock.getsockname()[0], "0.0.0.0")
 
     def test_a_host_without_ipv6_falls_back_to_ipv4(self):
-        real = socket.socket
+        real = socket.create_server
 
-        def no_ipv6(family=socket.AF_INET, *args, **kwargs):
+        def no_ipv6(address, *, family=socket.AF_INET, **kwargs):
             if family == socket.AF_INET6:
                 raise OSError(errno.EAFNOSUPPORT, "Address family not supported")
-            return real(family, *args, **kwargs)
+            return real(address, family=family, **kwargs)
 
-        with patch("peach.listening.socket.socket", side_effect=no_ipv6):
+        with patch("peach.listening.socket.create_server", side_effect=no_ipv6):
             sock, ipv6 = listening.bind("::", 0)
         with sock:
             self.assertFalse(ipv6)

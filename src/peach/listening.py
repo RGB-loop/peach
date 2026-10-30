@@ -59,32 +59,25 @@ def loopback_origin_host(host: str) -> str:
 def bind(host: str, port: int, *, ipv4_only: bool = False) -> tuple[socket.socket, bool]:
     """绑好监听套接字，返回套接字与是否接收 IPv6 连接。
 
-    「所有网卡」绑一个关闭 `IPV6_V6ONLY` 的 `::` 套接字，IPv4 连接以 `::ffff:a.b.c.d`
-    进来；系统或容器关掉了 IPv6、或调用方要求 `ipv4_only` 时绑 `0.0.0.0`。uvicorn 自己按
-    `host` 只建一个单栈套接字，asyncio 还会给 IPv6 套接字强制打开 `IPV6_V6ONLY`，所以由这里
-    建好再交给它。
+    「所有网卡」绑一个双栈 `::` 套接字，IPv4 连接以 `::ffff:a.b.c.d` 进来；系统或容器
+    关掉了 IPv6、或调用方要求 `ipv4_only` 时绑 `0.0.0.0`。uvicorn 自己按 `host` 只建一个
+    单栈套接字，asyncio 还会给 IPv6 套接字强制打开 `IPV6_V6ONLY`，所以由这里建好再交给它。
     """
-    if ipv4_only and host.strip() in ANY_HOSTS:
-        return _listen(socket.socket(socket.AF_INET, socket.SOCK_STREAM), ("0.0.0.0", port)), False
     if host.strip() in ANY_HOSTS:
-        if port:
-            # macOS 等 BSD 系统允许带 SO_REUSEADDR 的 `::` 叠在别人的 `0.0.0.0` 上，IPv4 连接
-            # 仍归对方。先按旧行为试绑一次 IPv4，端口被占就在这里报错。
-            _listen(socket.socket(socket.AF_INET, socket.SOCK_STREAM), ("0.0.0.0", port)).close()
-        try:
-            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-        except OSError:
-            LOGGER.info("系统没有可用的 IPv6，只监听 IPv4")
-        else:
+        if not ipv4_only and socket.has_dualstack_ipv6():
+            if port:
+                # macOS 等 BSD 系统允许带 SO_REUSEADDR 的 `::` 叠在别人的 `0.0.0.0` 上，IPv4
+                # 连接仍归对方。先按旧行为试绑一次 IPv4，端口被占就在这里报错。
+                socket.create_server(("0.0.0.0", port)).close()
             try:
-                return _listen(sock, ("::", port)), True
+                return _inheritable(socket.create_server(
+                    ("::", port), family=socket.AF_INET6, dualstack_ipv6=True)), True
             except OSError as exc:
                 # 端口被占、权限不够换成 IPv4 也一样失败；只有地址族不可用才退回。
                 if not ipv6_unavailable(exc):
                     raise
                 LOGGER.info("IPv6 监听不可用（%s），只监听 IPv4", exc)
-        return _listen(socket.socket(socket.AF_INET, socket.SOCK_STREAM), ("0.0.0.0", port)), False
+        return _inheritable(socket.create_server(("0.0.0.0", port))), False
     address = _parse(host)
     if address is None:
         family = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][0]
@@ -92,22 +85,10 @@ def bind(host: str, port: int, *, ipv4_only: bool = False) -> tuple[socket.socke
     else:
         family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
         target = (str(address), port)
-    return _listen(socket.socket(family, socket.SOCK_STREAM), target), family == socket.AF_INET6
+    return _inheritable(socket.create_server(target, family=family)), family == socket.AF_INET6
 
 
-def _listen(sock: socket.socket, target: tuple[str, int]) -> socket.socket:
-    # POSIX 用 SO_REUSEADDR 跳过 TIME_WAIT，与 uvicorn 自建套接字一致。Windows 上同一个选项
-    # 允许抢占别的程序正在监听的端口，两边各收一部分连接；那里改用 SO_EXCLUSIVEADDRUSE，
-    # 端口被占时如实报错。
-    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-    else:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(target)
-    except OSError:
-        sock.close()
-        raise
+def _inheritable(sock: socket.socket) -> socket.socket:
     sock.set_inheritable(True)
     return sock
 
